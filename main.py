@@ -1,11 +1,11 @@
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request,BackgroundTasks
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
 
-from app.database import engine, get_db, Base
+from app.database import engine, get_db, Base , SessionLocal
 from app.models import URL, Click
 from app.base62 import encode
 from app.cache import redis_client
@@ -78,34 +78,33 @@ def get_stats(short_code: str, db: Session = Depends(get_db)):
     }
 
 @app.get("/{short_code}")
-def redirect_to_url(short_code: str, request: Request, db: Session = Depends(get_db)):
+def redirect_to_url(short_code: str, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     # Step 1 — check Redis cache first
-    cached_url = redis_client.get(short_code)
-    if cached_url:
-        log_click(db, short_code, request)
-        return RedirectResponse(url=cached_url)
+    cached = redis_client.get(short_code)
+    if cached:
+        url_id, long_url = cached.split("|", 1)
+        background_tasks.add_task(log_click, int(url_id), request.headers.get("user-agent"), request.client.host)
+        return RedirectResponse(url=long_url)
 
-    # Step 2 — not in cache, check database
+    # Step 2 — cache miss, check database
     url = db.query(URL).filter(URL.short_code == short_code).first()
     if not url:
         raise HTTPException(status_code=404, detail="Short URL not found")
 
-    # Step 3 — store in cache for next time
-    redis_client.set(short_code, url.long_url)
+    # Step 3 — store in cache (url_id + long_url packed together)
+    redis_client.set(short_code, f"{url.id}|{url.long_url}")
 
-    # Step 4 — log the click
-    log_click(db, short_code, request)
+    # Step 4 — log click in background
+    background_tasks.add_task(log_click, url.id, request.headers.get("user-agent"), request.client.host)
 
     return RedirectResponse(url=url.long_url)
 
 
-def log_click(db: Session, short_code: str, request: Request):
-    url = db.query(URL).filter(URL.short_code == short_code).first()
-    if url:
-        click = Click(
-            url_id=url.id,
-            user_agent=request.headers.get("user-agent"),
-            ip_address=request.client.host
-        )
+def log_click(url_id: int, user_agent: str, ip_address: str):
+    db = SessionLocal()
+    try:
+        click = Click(url_id=url_id, user_agent=user_agent, ip_address=ip_address)
         db.add(click)
         db.commit()
+    finally:
+        db.close()
