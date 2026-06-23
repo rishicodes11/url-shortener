@@ -1,11 +1,14 @@
-from fastapi import FastAPI, Depends, HTTPException, Request,BackgroundTasks
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from fastapi import FastAPI, Depends, HTTPException, Request, BackgroundTasks
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
 
-from app.database import engine, get_db, Base , SessionLocal
+from app.database import engine, get_db, Base, SessionLocal
 from app.models import URL, Click
 from app.base62 import encode
 from app.cache import redis_client
@@ -17,15 +20,22 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="URL Shortener")
 
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+
 
 class ShortenRequest(BaseModel):
     long_url: str
 
+
 @app.post("/shorten")
-def shorten_url(request: ShortenRequest, db: Session = Depends(get_db)):
+@limiter.limit("10/minute")
+def shorten_url(request: Request, body: ShortenRequest, db: Session = Depends(get_db)):
     # Step 1 — create the URL row (short_code empty for now)
-    new_url = URL(long_url=request.long_url)
+    new_url = URL(long_url=body.long_url)
     db.add(new_url)
     db.commit()
     db.refresh(new_url)
@@ -38,7 +48,7 @@ def shorten_url(request: ShortenRequest, db: Session = Depends(get_db)):
     return {
         "short_url": f"{BASE_URL}/{short_code}",
         "short_code": short_code,
-        "long_url": request.long_url
+        "long_url": body.long_url
     }
 
 
@@ -77,7 +87,9 @@ def get_stats(short_code: str, db: Session = Depends(get_db)):
         "devices": devices
     }
 
+
 @app.get("/{short_code}")
+@limiter.limit("60/minute")
 def redirect_to_url(short_code: str, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     # Step 1 — check Redis cache first
     cached = redis_client.get(short_code)
