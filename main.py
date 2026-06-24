@@ -12,6 +12,7 @@ from app.database import engine, get_db, Base, SessionLocal
 from app.models import URL, Click
 from app.base62 import encode
 from app.cache import redis_client
+from datetime import datetime, timedelta, timezone
 
 load_dotenv()
 
@@ -29,18 +30,24 @@ BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 
 class ShortenRequest(BaseModel):
     long_url: str
+    expires_in_days: int | None = None
 
 
 @app.post("/shorten")
 @limiter.limit("10/minute")
 def shorten_url(request: Request, body: ShortenRequest, db: Session = Depends(get_db)):
-    # Step 1 — create the URL row (short_code empty for now)
-    new_url = URL(long_url=body.long_url)
+    # Calculate expiry date if provided
+    expires_at = None
+    if body.expires_in_days:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=body.expires_in_days)
+
+    # Step 1 — create the URL row
+    new_url = URL(long_url=body.long_url, expires_at=expires_at)
     db.add(new_url)
     db.commit()
     db.refresh(new_url)
 
-    # Step 2 — now we have an ID, generate the short code
+    # Step 2 — generate short code from ID
     short_code = encode(new_url.id)
     new_url.short_code = short_code
     db.commit()
@@ -48,9 +55,9 @@ def shorten_url(request: Request, body: ShortenRequest, db: Session = Depends(ge
     return {
         "short_url": f"{BASE_URL}/{short_code}",
         "short_code": short_code,
-        "long_url": body.long_url
+        "long_url": body.long_url,
+        "expires_at": expires_at
     }
-
 
 @app.get("/stats/{short_code}")
 def get_stats(short_code: str, db: Session = Depends(get_db)):
@@ -103,10 +110,18 @@ def redirect_to_url(short_code: str, request: Request, background_tasks: Backgro
     if not url:
         raise HTTPException(status_code=404, detail="Short URL not found")
 
-    # Step 3 — store in cache (url_id + long_url packed together)
-    redis_client.set(short_code, f"{url.id}|{url.long_url}")
+    # Step 3 — check if expired
+    if url.expires_at and url.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=410, detail="This short URL has expired")
 
-    # Step 4 — log click in background
+    # Step 4 — store in cache with TTL matching expiry
+    if url.expires_at:
+        seconds_left = int((url.expires_at - datetime.now(timezone.utc)).total_seconds())
+        redis_client.set(short_code, f"{url.id}|{url.long_url}", ex=seconds_left)
+    else:
+        redis_client.set(short_code, f"{url.id}|{url.long_url}")
+
+    # Step 5 — log click in background
     background_tasks.add_task(log_click, url.id, request.headers.get("user-agent"), request.client.host)
 
     return RedirectResponse(url=url.long_url)

@@ -10,6 +10,7 @@ class URL(Base):
     short_code = Column(String, unique=True, index=True, nullable=True)
     long_url = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=True)
 
     clicks = relationship("Click", back_populates="url")
 
