@@ -31,24 +31,42 @@ BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 class ShortenRequest(BaseModel):
     long_url: str
     expires_in_days: int | None = None
+    custom_code: str | None = None
 
+
+RESERVED_CODES = {"shorten", "stats", "docs", "openapi.json", "health"}
 
 @app.post("/shorten")
 @limiter.limit("10/minute")
 def shorten_url(request: Request, body: ShortenRequest, db: Session = Depends(get_db)):
-    # Calculate expiry date if provided
+    # Validate custom code if provided
+    if body.custom_code:
+        # Check for reserved words
+        if body.custom_code.lower() in RESERVED_CODES:
+            raise HTTPException(status_code=400, detail=f"'{body.custom_code}' is a reserved word")
+
+        # Check for invalid characters
+        if not body.custom_code.replace("-", "").replace("_", "").isalnum():
+            raise HTTPException(status_code=400, detail="Custom code can only contain letters, numbers, hyphens and underscores")
+
+        # Check if already taken
+        existing = db.query(URL).filter(URL.short_code == body.custom_code).first()
+        if existing:
+            raise HTTPException(status_code=409, detail=f"'{body.custom_code}' is already taken")
+
+    # Calculate expiry if provided
     expires_at = None
     if body.expires_in_days:
         expires_at = datetime.now(timezone.utc) + timedelta(days=body.expires_in_days)
 
-    # Step 1 — create the URL row
+    # Step 1 — create URL row
     new_url = URL(long_url=body.long_url, expires_at=expires_at)
     db.add(new_url)
     db.commit()
     db.refresh(new_url)
 
-    # Step 2 — generate short code from ID
-    short_code = encode(new_url.id)
+    # Step 2 — use custom code or generate from ID
+    short_code = body.custom_code if body.custom_code else encode(new_url.id)
     new_url.short_code = short_code
     db.commit()
 
@@ -56,7 +74,8 @@ def shorten_url(request: Request, body: ShortenRequest, db: Session = Depends(ge
         "short_url": f"{BASE_URL}/{short_code}",
         "short_code": short_code,
         "long_url": body.long_url,
-        "expires_at": expires_at
+        "expires_at": expires_at,
+        "custom": body.custom_code is not None
     }
 
 @app.get("/stats/{short_code}")
