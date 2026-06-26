@@ -56,7 +56,10 @@ def shorten_url(request: Request, body: ShortenRequest, db: Session = Depends(ge
 
     # Calculate expiry if provided
     expires_at = None
-    if body.expires_in_days:
+    if body.expires_in_days is not None:
+     if body.expires_in_days < 0:
+        raise HTTPException(status_code=400, detail="Expiry days cannot be negative")
+     if body.expires_in_days > 0:
         expires_at = datetime.now(timezone.utc) + timedelta(days=body.expires_in_days)
 
     # Step 1 — create URL row
